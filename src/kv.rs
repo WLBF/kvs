@@ -2,19 +2,18 @@ use crate::error::{KvsError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, BTreeMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write, Read};
+use std::io::{self, Seek, SeekFrom, Write, Read, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 /// The `KvStore` stores string key/value pairs.
-///
 pub struct KvStore {
     path: PathBuf,
     current_term: u64,
     index: BTreeMap<String, Pos>,
-    readers: HashMap<u64, File>,
-    writer: File,
+    readers: HashMap<u64, BufReader<File>>,
+    writer: BufWriter<File>,
     redundant: u64,
 }
 
@@ -95,7 +94,7 @@ impl KvStore {
     pub fn remove(&mut self, key: String) -> Result<()> {
         if self.index.contains_key(&key) {
             let cmd = Command::Remove { key: key.clone() };
-            serde_json::to_writer(&self.writer, &cmd)?;
+            serde_json::to_writer(&mut self.writer, &cmd)?;
             self.writer.flush()?;
             self.index.remove(&key).map(|p| self.redundant += p.len);
             return Ok(());
@@ -148,7 +147,7 @@ impl KvStore {
     }
 }
 
-fn load_file(term: u64, readers: &mut HashMap<u64, File>, index: &mut BTreeMap<String, Pos>) -> Result<u64> {
+fn load_file(term: u64, readers: &mut HashMap<u64, BufReader<File>>, index: &mut BTreeMap<String, Pos>) -> Result<u64> {
     let reader = readers.get_mut(&term).expect("log reader not found");
     let mut stream = serde_json::Deserializer::from_reader(reader).into_iter::<Command>();
     let mut offset: u64 = 0;
@@ -169,7 +168,7 @@ fn load_file(term: u64, readers: &mut HashMap<u64, File>, index: &mut BTreeMap<S
     Ok(redundant)
 }
 
-fn new_reader(dir: &Path, term: u64) -> Result<File> {
+fn new_reader(dir: &Path, term: u64) -> Result<BufReader<File>> {
     let path = log_path(dir, term);
 
     let file = OpenOptions::new()
@@ -178,10 +177,10 @@ fn new_reader(dir: &Path, term: u64) -> Result<File> {
         .create(true)
         .open(&path)?;
 
-    Ok(file)
+    Ok(BufReader::new(file))
 }
 
-fn new_writer(dir: &Path, term: u64) -> Result<File> {
+fn new_writer(dir: &Path, term: u64) -> Result<BufWriter<File>> {
     let path = log_path(dir, term);
 
     let file = OpenOptions::new()
@@ -190,7 +189,7 @@ fn new_writer(dir: &Path, term: u64) -> Result<File> {
         .create(true)
         .open(&path)?;
 
-    Ok(file)
+    Ok(BufWriter::new(file))
 }
 
 fn sort_terms(path: &Path) -> Result<Vec<u64>> {
