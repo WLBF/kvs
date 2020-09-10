@@ -17,8 +17,20 @@ pub enum KvsError {
     Io(#[from] io::Error),
 
     /// Serde json error
-    #[error("serde json error")]
+    #[error("Serde json error")]
     SerdeJson(#[from] serde_json::error::Error),
+
+    /// Sled error
+    #[error("Sled error")]
+    Sled(#[from] sled::Error),
+
+    /// From utf8 error
+    #[error("From utf8 error")]
+    FromUtf8(#[from] std::string::FromUtf8Error),
+
+    /// String error
+    #[error("String error `{0}`")]
+    StringError(String),
 }
 
 /// Custom defined `Result` type.

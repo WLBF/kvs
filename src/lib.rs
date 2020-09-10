@@ -1,8 +1,13 @@
 #![deny(missing_docs)]
 //! A simple key/value store.
 
-pub use error::{KvsError, Result};
-pub use kv::KvStore;
+pub use engines::*;
+pub use error::*;
+pub use server::*;
+pub use client::*;
 
+mod common;
+mod engines;
 mod error;
-mod kv;
+mod server;
+mod client;
