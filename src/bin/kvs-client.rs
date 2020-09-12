@@ -1,6 +1,6 @@
+use kvs::*;
 use std::process::exit;
 use structopt::StructOpt;
-use kvs::*;
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:4000";
 
@@ -18,7 +18,7 @@ enum Command {
         key: String,
         value: String,
 
-        /// Server ip address (IP-PORT)
+        /// Server ip address
         #[structopt(default_value = DEFAULT_ADDRESS, short, long)]
         addr: String,
     },
@@ -27,7 +27,7 @@ enum Command {
     Get {
         key: String,
 
-        /// Server ip address (IP-PORT)
+        /// Server ip address
         #[structopt(default_value = DEFAULT_ADDRESS, short, long)]
         addr: String,
     },
@@ -36,7 +36,7 @@ enum Command {
     Rm {
         key: String,
 
-        /// Server ip address (IP-PORT)
+        /// Server ip address
         #[structopt(default_value = DEFAULT_ADDRESS, short, long)]
         addr: String,
     },

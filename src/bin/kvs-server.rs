@@ -14,7 +14,7 @@ const DEFAULT_ENGINE: Engine = Engine::kvs;
 #[derive(StructOpt)]
 #[structopt(author, about)]
 struct Opt {
-    /// Server ip address (IP-PORT)
+    /// Server ip address
     #[structopt(default_value = DEFAULT_ADDRESS, short, long)]
     addr: String,
 
