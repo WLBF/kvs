@@ -1,6 +1,6 @@
 use clap::arg_enum;
-use kvs::*;
-use log::{error, info};
+use kvs::{self, thread_pool::*, KvStore, KvsServer, Result, SledKvsEngine};
+use log::{error, info, LevelFilter};
 use std::env::current_dir;
 use std::fmt::Debug;
 use std::fs::{self, File};
@@ -19,7 +19,7 @@ struct Opt {
     addr: String,
 
     /// Engine name
-    #[structopt(short, long, possible_values = & Engine::variants())]
+    #[structopt(long, possible_values = & Engine::variants())]
     engine: Option<Engine>,
 }
 
@@ -35,11 +35,7 @@ arg_enum! {
 fn main() {
     let opt = Opt::from_args();
 
-    stderrlog::new()
-        .module(module_path!())
-        .verbosity(4)
-        .init()
-        .expect("init stderr log failed");
+    env_logger::builder().filter_level(LevelFilter::Info).init();
 
     if let Err(e) = start(opt) {
         error!("start failed: {}", e);
@@ -57,13 +53,15 @@ fn start(opt: Opt) -> Result<()> {
     // write engines to engines file
     fs::write(current_dir()?.join("engine"), format!("{}", engine))?;
 
+    let pool = RayonThreadPool::new(num_cpus::get() as u32)?;
+
     match engine {
         Engine::kvs => {
-            let server = KvsServer::new(KvStore::open(current_dir()?)?);
+            let server = KvsServer::new(KvStore::open(current_dir()?)?, pool);
             server.run(opt.addr)
         }
         Engine::sled => {
-            let server = KvsServer::new(SledStore::new(sled::open(current_dir()?)?));
+            let server = KvsServer::new(SledKvsEngine::new(sled::open(current_dir()?)?), pool);
             server.run(opt.addr)
         }
     }

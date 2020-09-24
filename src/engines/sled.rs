@@ -4,24 +4,24 @@ use sled::{Db, Tree};
 
 /// Wrapper of `sled::Db`
 #[derive(Clone)]
-pub struct SledStore(Db);
+pub struct SledKvsEngine(Db);
 
-impl SledStore {
+impl SledKvsEngine {
     /// Creates a `SledKvsEngine` from `sled::Db`.
     pub fn new(db: Db) -> Self {
-        SledStore(db)
+        SledKvsEngine(db)
     }
 }
 
-impl KvsEngine for SledStore {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+impl KvsEngine for SledKvsEngine {
+    fn set(&self, key: String, value: String) -> Result<()> {
         let tree: &Tree = &self.0;
         tree.insert(key, value.into_bytes())?;
         tree.flush()?;
         Ok(())
     }
 
-    fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&self, key: String) -> Result<Option<String>> {
         let tree: &Tree = &self.0;
         Ok(tree
             .get(key)?
@@ -30,7 +30,7 @@ impl KvsEngine for SledStore {
             .transpose()?)
     }
 
-    fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&self, key: String) -> Result<()> {
         let tree: &Tree = &self.0;
         tree.remove(key)?.ok_or(KvsError::KeyNotFound)?;
         tree.flush()?;

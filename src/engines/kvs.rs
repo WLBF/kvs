@@ -5,11 +5,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 /// The `KvStore` stores string key/value pairs.
-pub struct KvStore {
+#[derive(Clone)]
+pub struct KvStore(Arc<Mutex<SharedKvStore>>);
+
+struct SharedKvStore {
     path: PathBuf,
     current_term: u64,
     index: BTreeMap<String, Pos>,
@@ -18,9 +23,9 @@ pub struct KvStore {
     redundant: u64,
 }
 
-impl KvStore {
-    /// Open the KvStore at a given path. Return the KvStore.
-    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
+impl SharedKvStore {
+    /// Open the SharedKvStore at a given path. Return the SharedKvStore.
+    pub fn open(path: impl Into<PathBuf>) -> Result<SharedKvStore> {
         let path = path.into();
         let terms = sort_terms(&path)?;
 
@@ -39,7 +44,7 @@ impl KvStore {
 
         let writer = new_writer(&path, current_term)?;
 
-        Ok(KvStore {
+        Ok(SharedKvStore {
             path,
             current_term,
             index,
@@ -96,9 +101,7 @@ impl KvStore {
         self.redundant = 0;
         Ok(())
     }
-}
 
-impl KvsEngine for KvStore {
     /// Sets the value of a string key to a string.
     ///
     /// If the key already exists, the previous value will be overwritten.
@@ -168,6 +171,41 @@ impl KvsEngine for KvStore {
         }
 
         Err(KvsError::KeyNotFound)
+    }
+}
+impl KvStore {
+    /// Open the KvStore at a given path. Return the KvStore.
+    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
+        let inner = SharedKvStore::open(path)?;
+        Ok(KvStore(Arc::new(Mutex::new(inner))))
+    }
+}
+
+impl KvsEngine for KvStore {
+    /// Sets the value of a string key to a string.
+    ///
+    /// If the key already exists, the previous value will be overwritten.
+    fn set(&self, key: String, value: String) -> Result<()> {
+        let mut sk = self.0.lock().unwrap();
+        sk.set(key, value)
+    }
+
+    /// Gets the string value of a given string key.
+    ///
+    /// Returns `None` if the given key does not exist.
+    fn get(&self, key: String) -> Result<Option<String>> {
+        let mut sk = self.0.lock().unwrap();
+        sk.get(key)
+    }
+
+    /// Removes a given key.
+    ///
+    /// # Errors
+    ///
+    /// It returns `KvsError::KeyNotFound` if the given key is not found.
+    fn remove(&self, key: String) -> Result<()> {
+        let mut sk = self.0.lock().unwrap();
+        sk.remove(key)
     }
 }
 

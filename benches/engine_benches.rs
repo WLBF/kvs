@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use kvs::{KvStore, KvsEngine, SledStore};
+use kvs::{KvStore, KvsEngine, SledKvsEngine};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use std::collections::HashMap;
@@ -44,7 +44,7 @@ pub fn write_bench(c: &mut Criterion) {
                     temp_dir,
                 )
             },
-            |(mut store, data_map, _temp_dir)| {
+            |(store, data_map, _temp_dir)| {
                 for (key, value) in data_map {
                     assert!(store.set(key, value).is_ok(), "kvs store set error");
                 }
@@ -58,12 +58,12 @@ pub fn write_bench(c: &mut Criterion) {
             || {
                 let temp_dir = TempDir::new().unwrap();
                 (
-                    SledStore::new(sled::open(&temp_dir).unwrap()),
+                    SledKvsEngine::new(sled::open(&temp_dir).unwrap()),
                     data_map.clone(),
                     temp_dir,
                 )
             },
-            |(mut store, data_map, _temp_dir)| {
+            |(store, data_map, _temp_dir)| {
                 for (key, value) in data_map {
                     assert!(store.set(key, value).is_ok(), "sled store set error");
                 }
@@ -85,13 +85,13 @@ pub fn read_bench(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let temp_dir = TempDir::new().unwrap();
-                let mut store = KvStore::open(temp_dir.path()).unwrap();
+                let store = KvStore::open(temp_dir.path()).unwrap();
                 for (key, value) in data_map.clone() {
                     store.set(key, value).unwrap();
                 }
                 (store, read_keys.clone(), temp_dir)
             },
-            |(mut store, read_keys, _temp_dir)| {
+            |(store, read_keys, _temp_dir)| {
                 for key in read_keys {
                     assert!(store.get(key).is_ok(), "kvs store get error");
                 }
@@ -104,13 +104,13 @@ pub fn read_bench(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let temp_dir = TempDir::new().unwrap();
-                let mut store = SledStore::new(sled::open(&temp_dir).unwrap());
+                let store = SledKvsEngine::new(sled::open(&temp_dir).unwrap());
                 for (key, value) in data_map.clone() {
                     store.set(key, value).unwrap();
                 }
                 (store, read_keys.clone(), temp_dir)
             },
-            |(mut store, read_keys, _temp_dir)| {
+            |(store, read_keys, _temp_dir)| {
                 for key in read_keys {
                     assert!(store.get(key).is_ok(), "sled store get error");
                 }
