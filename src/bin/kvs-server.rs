@@ -6,6 +6,7 @@ use std::fmt::Debug;
 use std::fs::{self, File};
 use std::io::Read;
 use std::process::exit;
+use std::thread;
 use structopt::StructOpt;
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:4000";
@@ -57,12 +58,18 @@ fn start(opt: Opt) -> Result<()> {
 
     match engine {
         Engine::kvs => {
-            let server = KvsServer::new(KvStore::open(current_dir()?)?, pool);
-            server.run(opt.addr)
+            let mut server = KvsServer::new(KvStore::open(current_dir()?)?, pool);
+            server.run(opt.addr)?;
+            loop {
+                thread::park()
+            }
         }
         Engine::sled => {
-            let server = KvsServer::new(SledKvsEngine::new(sled::open(current_dir()?)?), pool);
-            server.run(opt.addr)
+            let mut server = KvsServer::new(SledKvsEngine::new(sled::open(current_dir()?)?), pool);
+            server.run(opt.addr)?;
+            loop {
+                thread::park()
+            }
         }
     }
 }

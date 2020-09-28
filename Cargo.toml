@@ -32,5 +32,5 @@ crossbeam-utils = "0.7"
 panic-control = "0.1.4"
 
 [[bench]]
-name = "engine_benches"
+name = "benches"
 harness = false
