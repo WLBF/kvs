@@ -19,6 +19,7 @@ sled = "0.34.3"
 crossbeam = "0.7.3"
 rayon = "1.4.0"
 num_cpus = "1.13.0"
+crossbeam-skiplist = { version = "0.0.0", git = "https://github.com/crossbeam-rs/crossbeam.git", rev = "51fbe0f" }
 
 [dev-dependencies]
 assert_cmd = "0.11"

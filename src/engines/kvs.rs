@@ -1,183 +1,76 @@
 use crate::error::{KvsError, Result};
 use crate::KvsEngine;
+use crossbeam_skiplist::SkipMap;
+use log::error;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 /// The `KvStore` stores string key/value pairs.
 #[derive(Clone)]
-pub struct KvStore(Arc<Mutex<SharedKvStore>>);
-
-struct SharedKvStore {
-    path: PathBuf,
-    current_term: u64,
-    index: BTreeMap<String, Pos>,
-    readers: HashMap<u64, BufReader<File>>,
-    writer: BufWriter<File>,
-    redundant: u64,
+pub struct KvStore {
+    path: Arc<PathBuf>,
+    index: Arc<SkipMap<String, Pos>>,
+    reader: KvsReader,
+    writer: Arc<Mutex<KvsWriter>>,
 }
 
-impl SharedKvStore {
-    /// Open the SharedKvStore at a given path. Return the SharedKvStore.
-    pub fn open(path: impl Into<PathBuf>) -> Result<SharedKvStore> {
-        let path = path.into();
-        let terms = sort_terms(&path)?;
-
-        let current_term = terms.last().copied().unwrap_or(0) + 1;
-
-        let mut redundant = 0;
-        let mut readers = HashMap::new();
-        let mut index = BTreeMap::new();
-
-        readers.insert(current_term, new_reader(&path, current_term)?);
-
-        for term in terms {
-            readers.insert(term, new_reader(&path, term)?);
-            redundant += load_file(term, &mut readers, &mut index)?;
-        }
-
-        let writer = new_writer(&path, current_term)?;
-
-        Ok(SharedKvStore {
-            path,
-            current_term,
-            index,
-            readers,
-            writer,
-            redundant,
-        })
-    }
-
-    fn compact(&mut self) -> Result<()> {
-        let compact_term = self.current_term + 1;
-        self.current_term += 2;
-
-        let mut compact_writer = new_writer(&self.path, compact_term)?;
-        self.writer = new_writer(&self.path, self.current_term)?;
-
-        let compact_reader = new_reader(&self.path, compact_term)?;
-        let current_reader = new_reader(&self.path, compact_term)?;
-        self.readers.insert(compact_term, compact_reader);
-        self.readers.insert(self.current_term, current_reader);
-
-        let mut offset: u64 = 0;
-        for pos in self.index.values_mut() {
-            let reader = self
-                .readers
-                .get_mut(&pos.term)
-                .expect("log reader not found");
-            reader.seek(SeekFrom::Start(pos.offset))?;
-            let mut cmd_reader = reader.take(pos.len);
-
-            let len = io::copy(&mut cmd_reader, &mut compact_writer)?;
-
-            *pos = Pos {
-                term: compact_term,
-                offset,
-                len: pos.len,
-            };
-            offset += len;
-        }
-        compact_writer.flush()?;
-
-        let stale_terms: Vec<u64> = self
-            .readers
-            .keys()
-            .filter(|&&t| t < compact_term)
-            .cloned()
-            .collect();
-        for term in stale_terms {
-            self.readers.remove(&term);
-            let path = log_path(&self.path, term);
-            fs::remove_file(path)?
-        }
-
-        self.redundant = 0;
-        Ok(())
-    }
-
-    /// Sets the value of a string key to a string.
-    ///
-    /// If the key already exists, the previous value will be overwritten.
-    fn set(&mut self, key: String, value: String) -> Result<()> {
-        let cmd = Command::Set {
-            key: key.clone(),
-            value,
-        };
-        let offset = self.writer.seek(SeekFrom::Current(0))?;
-        serde_json::to_writer(&mut self.writer, &cmd)?;
-        self.writer.flush()?;
-        let new_offset = self.writer.seek(SeekFrom::Current(0))?;
-        let pos = Pos {
-            term: self.current_term,
-            offset,
-            len: new_offset - offset,
-        };
-
-        if let Some(p) = self.index.insert(key, pos) {
-            self.redundant += p.len;
-        }
-
-        if self.redundant > COMPACTION_THRESHOLD {
-            self.compact()?;
-        }
-
-        Ok(())
-    }
-
-    /// Gets the string value of a given string key.
-    ///
-    /// Returns `None` if the given key does not exist.
-    fn get(&mut self, key: String) -> Result<Option<String>> {
-        if let Some(pos) = self.index.get(&key) {
-            let reader = self
-                .readers
-                .get_mut(&pos.term)
-                .expect("log reader not found");
-            reader.seek(SeekFrom::Start(pos.offset))?;
-            let cmd_reader = reader.take(pos.len);
-
-            return match serde_json::from_reader(cmd_reader)? {
-                Command::Set { key: _, value } => Ok(Some(value)),
-                Command::Remove { .. } => Err(KvsError::UnexpectedCommandType),
-            };
-        }
-
-        Ok(None)
-    }
-
-    /// Remove a given key
-    ///
-    /// Returns `KvsError::KeyNotFound` if the given key does not exist.
-    fn remove(&mut self, key: String) -> Result<()> {
-        if self.index.contains_key(&key) {
-            let cmd = Command::Remove { key: key.clone() };
-            serde_json::to_writer(&mut self.writer, &cmd)?;
-            self.writer.flush()?;
-            if let Some(p) = self.index.remove(&key) {
-                self.redundant += p.len;
-            }
-            return Ok(());
-        }
-
-        if self.redundant > COMPACTION_THRESHOLD {
-            self.compact()?;
-        }
-
-        Err(KvsError::KeyNotFound)
-    }
-}
 impl KvStore {
-    /// Open the KvStore at a given path. Return the KvStore.
+    /// Opens a `KvStore` with the given path.
+    ///
+    /// This will create a new directory if the given one does not exist.
+    ///
+    /// # Errors
+    ///
+    /// It propagates I/O or deserialization errors during the log replay.
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
-        let inner = SharedKvStore::open(path)?;
-        Ok(KvStore(Arc::new(Mutex::new(inner))))
+        let path = Arc::new(path.into());
+        fs::create_dir_all(&*path)?;
+
+        let mut readers = BTreeMap::new();
+        let index = Arc::new(SkipMap::new());
+
+        let terms = sorted_terms(&path)?;
+        let mut uncompacted = 0;
+
+        for &term in &terms {
+            let mut reader = BufReader::new(File::open(log_path(&path, term))?);
+            uncompacted += load(term, &mut reader, &*index)?;
+            readers.insert(term, reader);
+        }
+
+        let current_term = terms.last().unwrap_or(&0) + 1;
+        let writer = new_writer(&path, current_term)?;
+        let safe_point = Arc::new(AtomicU64::new(0));
+
+        let reader = KvsReader {
+            path: Arc::clone(&path),
+            safe_point,
+            readers: RefCell::new(readers),
+        };
+
+        let writer = KvsWriter {
+            reader: reader.clone(),
+            writer,
+            current_term,
+            uncompacted,
+            path: Arc::clone(&path),
+            index: Arc::clone(&index),
+        };
+
+        Ok(KvStore {
+            path,
+            reader,
+            index,
+            writer: Arc::new(Mutex::new(writer)),
+        })
     }
 }
 
@@ -185,39 +78,45 @@ impl KvsEngine for KvStore {
     /// Sets the value of a string key to a string.
     ///
     /// If the key already exists, the previous value will be overwritten.
+    ///
+    /// # Errors
+    ///
+    /// It propagates I/O or serialization errors during writing the log.
     fn set(&self, key: String, value: String) -> Result<()> {
-        let mut sk = self.0.lock().unwrap();
-        sk.set(key, value)
+        self.writer.lock().unwrap().set(key, value)
     }
 
     /// Gets the string value of a given string key.
     ///
     /// Returns `None` if the given key does not exist.
     fn get(&self, key: String) -> Result<Option<String>> {
-        let mut sk = self.0.lock().unwrap();
-        sk.get(key)
+        if let Some(entry) = self.index.get(&key) {
+            if let Command::Set { value, .. } = self.reader.read_cmd(*entry.value())? {
+                Ok(Some(value))
+            } else {
+                Err(KvsError::UnexpectedCommandType)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Removes a given key.
     ///
-    /// # Errors
+    /// # Error
     ///
     /// It returns `KvsError::KeyNotFound` if the given key is not found.
+    ///
+    /// It propagates I/O or serialization errors during writing the log.
     fn remove(&self, key: String) -> Result<()> {
-        let mut sk = self.0.lock().unwrap();
-        sk.remove(key)
+        self.writer.lock().unwrap().remove(key)
     }
 }
 
-fn load_file(
-    term: u64,
-    readers: &mut HashMap<u64, BufReader<File>>,
-    index: &mut BTreeMap<String, Pos>,
-) -> Result<u64> {
-    let reader = readers.get_mut(&term).expect("log reader not found");
+fn load(term: u64, reader: &mut BufReader<File>, index: &SkipMap<String, Pos>) -> Result<u64> {
+    let mut offset: u64 = reader.seek(SeekFrom::Start(0))?;
     let mut stream = serde_json::Deserializer::from_reader(reader).into_iter::<Command>();
-    let mut offset: u64 = 0;
-    let mut redundant: u64 = 0;
+    let mut uncompacted: u64 = 0;
     while let Some(res) = stream.next() {
         let new_offset = stream.byte_offset() as u64;
         let pos = Pos {
@@ -226,28 +125,23 @@ fn load_file(
             len: new_offset - offset,
         };
         match res? {
-            Command::Set { key, .. } => index.insert(key, pos).map(|p| redundant += p.len),
+            Command::Set { key, .. } => {
+                if let Some(entry) = index.get(&key) {
+                    uncompacted += entry.value().len;
+                }
+                index.insert(key, pos);
+            }
             Command::Remove { key } => {
-                redundant += new_offset - offset;
-                index.remove(&key).map(|p| redundant += p.len)
+                if let Some(entry) = index.remove(&key) {
+                    uncompacted += entry.value().len;
+                }
+                uncompacted += new_offset - offset;
             }
         };
         offset = new_offset;
     }
 
-    Ok(redundant)
-}
-
-fn new_reader(dir: &Path, term: u64) -> Result<BufReader<File>> {
-    let path = log_path(dir, term);
-
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&path)?;
-
-    Ok(BufReader::new(file))
+    Ok(uncompacted)
 }
 
 fn new_writer(dir: &Path, term: u64) -> Result<BufWriter<File>> {
@@ -262,7 +156,7 @@ fn new_writer(dir: &Path, term: u64) -> Result<BufWriter<File>> {
     Ok(BufWriter::new(file))
 }
 
-fn sort_terms(path: &Path) -> Result<Vec<u64>> {
+fn sorted_terms(path: &Path) -> Result<Vec<u64>> {
     let mut terms = fs::read_dir(path)?
         .flat_map(|res| {
             res.expect("log file error")
@@ -289,9 +183,159 @@ enum Command {
     Remove { key: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Pos {
     term: u64,
     offset: u64,
     len: u64,
+}
+
+struct KvsReader {
+    path: Arc<PathBuf>,
+    safe_point: Arc<AtomicU64>,
+    readers: RefCell<BTreeMap<u64, BufReader<File>>>,
+}
+
+impl Clone for KvsReader {
+    fn clone(&self) -> KvsReader {
+        KvsReader {
+            path: Arc::clone(&self.path),
+            safe_point: Arc::clone(&self.safe_point),
+            readers: RefCell::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl KvsReader {
+    fn close_stale_handles(&self) {
+        let mut readers = self.readers.borrow_mut();
+        while !readers.is_empty() {
+            let term = *readers.keys().next().unwrap();
+            if self.safe_point.load(Ordering::SeqCst) <= term {
+                break;
+            }
+            readers.remove(&term);
+        }
+    }
+
+    fn read_and<F, R>(&self, pos: Pos, f: F) -> Result<R>
+    where
+        F: FnOnce(io::Take<&mut BufReader<File>>) -> Result<R>,
+    {
+        self.close_stale_handles();
+
+        let mut readers = self.readers.borrow_mut();
+        if !readers.contains_key(&pos.term) {
+            let file = File::open(log_path(&self.path, pos.term))?;
+            let reader = BufReader::new(file);
+            readers.insert(pos.term, reader);
+        }
+
+        let reader = readers.get_mut(&pos.term).unwrap();
+        reader.seek(SeekFrom::Start(pos.offset))?;
+        let cmd_reader = reader.take(pos.len);
+        f(cmd_reader)
+    }
+
+    fn read_cmd(&self, pos: Pos) -> Result<Command> {
+        self.read_and(pos, |cmd_reader| Ok(serde_json::from_reader(cmd_reader)?))
+    }
+}
+
+struct KvsWriter {
+    path: Arc<PathBuf>,
+    current_term: u64,
+    uncompacted: u64,
+    reader: KvsReader,
+    writer: BufWriter<File>,
+    index: Arc<SkipMap<String, Pos>>,
+}
+
+impl KvsWriter {
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        let cmd = Command::Set {
+            key: key.clone(),
+            value,
+        };
+        let offset = self.writer.seek(SeekFrom::Current(0))?;
+        serde_json::to_writer(&mut self.writer, &cmd)?;
+        self.writer.flush()?;
+        let new_offset = self.writer.seek(SeekFrom::Current(0))?;
+        let pos = Pos {
+            term: self.current_term,
+            offset,
+            len: new_offset - offset,
+        };
+
+        if let Some(entry) = self.index.get(&key) {
+            self.uncompacted += entry.value().len;
+        }
+        self.index.insert(key, pos);
+
+        if self.uncompacted > COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
+
+        Ok(())
+    }
+
+    fn remove(&mut self, key: String) -> Result<()> {
+        if self.index.contains_key(&key) {
+            let cmd = Command::Remove { key: key.clone() };
+            serde_json::to_writer(&mut self.writer, &cmd)?;
+            self.writer.flush()?;
+            if let Some(entry) = self.index.remove(&key) {
+                self.uncompacted += entry.value().len;
+            }
+            return Ok(());
+        }
+
+        if self.uncompacted > COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
+
+        Err(KvsError::KeyNotFound)
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        let compact_term = self.current_term + 1;
+        self.current_term += 2;
+
+        let mut compact_writer = new_writer(&self.path, compact_term)?;
+        self.writer = new_writer(&self.path, self.current_term)?;
+
+        let mut offset: u64 = 0;
+        for entry in self.index.iter() {
+            let len = self.reader.read_and(*entry.value(), |mut entry_reader| {
+                Ok(io::copy(&mut entry_reader, &mut compact_writer)?)
+            })?;
+
+            let new_pos = Pos {
+                term: compact_term,
+                offset,
+                len: entry.value().len,
+            };
+            self.index.insert(entry.key().clone(), new_pos);
+
+            offset += len;
+        }
+        compact_writer.flush()?;
+
+        self.reader.safe_point.store(compact_term, Ordering::SeqCst);
+        self.reader.close_stale_handles();
+
+        let stale_terms = sorted_terms(&self.path)?
+            .into_iter()
+            .filter(|&gen| gen < compact_term);
+
+        for term in stale_terms {
+            let path = log_path(&self.path, term);
+            if let Err(e) = fs::remove_file(&path) {
+                error!("{:?} cannot be deleted: {}", path, e);
+            }
+        }
+
+        self.uncompacted = 0;
+        Ok(())
+    }
 }
